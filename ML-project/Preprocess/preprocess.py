@@ -8,7 +8,7 @@ import pandas as pd
 import scipy.optimize as op
 from astropy.table import Table, vstack
 
-from astronet.constants import LSST_PB_WAVELENGTHS
+from constants import LSST_PB_WAVELENGTHS
 
 
 def __filter_dataframe_only_supernova(
