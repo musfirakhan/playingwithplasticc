@@ -8,9 +8,17 @@ import sys
 import time
 import warnings
 from pathlib import Path
-
+import platform
 import numpy as np
 import psutil
+import io
+import imageio
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from PIL import Image
+
+from compress import print_sparsity
+from utils import astronet_logger
 import tensorflow as tf
 from sklearn.metrics import precision_score, recall_score
 from tensorflow.keras import optimizers
@@ -21,16 +29,6 @@ from tensorflow.keras.callbacks import (
     ReduceLROnPlateau,
 )
 
-from constants import (
-    PROJECT_WORKING_DIRECTORY as asnwd,
-    DATA_DIR,
-    TRAINING_DIR,
-    SYSTEM
-)
-from custom_callbacks import (
-    PrintModelSparsity,
-    TimeHistoryCallback,
-)
 from datasets import (
     lazy_load_plasticc_noZ,
     lazy_load_plasticc_wZ,
@@ -41,6 +39,192 @@ from metrics import (
     WeightedLogLoss,
 )
 from utils import astronet_logger, find_optimal_batch_size
+
+
+log = astronet_logger(__file__)
+
+# Visualization utilities
+plt.rc("font", size=20)
+plt.rc("figure", figsize=(15, 3))
+
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+
+class SGEBreakoutCallback(tf.keras.callbacks.Callback):
+    def __init__(self, threshold=24):
+        super(SGEBreakoutCallback, self).__init__()
+        self.threshold = threshold
+
+    def on_epoch_end(self, epoch, logs={}):
+        hrs = subprocess.run(
+            f"qstat -j {os.environ.get('JOB_ID')} | grep 'cpu' | awk '{{print $3}}' | awk -F ':' '{{print $1}}' | awk -F  '=' '{{print $2}}'",
+            check=True,
+            capture_output=True,
+            shell=True,
+            text=True,
+        ).stdout.strip()
+
+        if int(hrs) > self.threshold:
+            log.info("Stopping training...")
+            self.model.stop_training = True
+
+
+class PrintModelSparsity(tf.keras.callbacks.Callback):
+    def on_epoch_begin(self, epoch, logs={}):
+        sparsity = print_sparsity(self.model)
+        log.info(f"Epoch Start -- Current level of sparsity: {sparsity}")
+
+    def on_epoch_end(self, epoch, logs={}):
+        sparsity = print_sparsity(self.model)
+        log.info(f"Epoch End -- Current level of sparsity: {sparsity}")
+
+
+class TimeHistoryCallback(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.times = []
+
+    def on_epoch_begin(self, epoch, logs={}):
+        self.epoch_time_start = time.time()
+
+    def on_epoch_end(self, epoch, logs={}):
+        self.times.append(time.time() - self.epoch_time_start)
+
+
+class DetectOverfittingCallback(tf.keras.callbacks.Callback):
+    def __init__(self, threshold=0.7):
+        super(DetectOverfittingCallback, self).__init__()
+        self.threshold = threshold
+
+    def on_epoch_end(self, epoch, logs=None):
+        ratio = logs["val_loss"] / logs["loss"]
+        print(
+            f"Epoch: {epoch}, Val/Train loss ratio: {ratio:.2f} -- \n"
+            f"val_loss: {logs['val_loss']}, loss: {logs['loss']}"
+        )
+
+        if ratio > self.threshold:
+            print("Stopping training...")
+            self.model.stop_training = True
+
+
+class VisCallback(tf.keras.callbacks.Callback):
+    def __init__(self, inputs, ground_truth, display_freq=10, n_samples=10):
+        self.inputs = inputs
+        self.ground_truth = ground_truth
+        self.images = []
+        self.display_freq = display_freq
+        self.n_samples = n_samples
+
+    def __display_digits(self, inputs, outputs, ground_truth, epoch, n=10):
+        plt.clf()
+
+        plt.yticks([])
+        plt.grid(None)
+        inputs = np.reshape(inputs, [n, 28, 28])
+        inputs = np.swapaxes(inputs, 0, 1)
+        inputs = np.reshape(inputs, [28, 28 * n])
+        plt.imshow(inputs)
+        plt.xticks([28 * x + 14 for x in range(n)], outputs)
+        for i, t in enumerate(plt.gca().xaxis.get_ticklabels()):
+            if outputs[i] == ground_truth[i]:
+                t.set_color("green")
+            else:
+                t.set_color("red")
+        plt.grid(None)
+
+    def on_epoch_end(self, epoch, logs=None):
+        np.random.seed(RANDOM_SEED)
+        indexes = np.random.choice(len(self.inputs), size=self.n_samples)
+        X_test, y_test = self.inputs[indexes], self.ground_truth[indexes]
+        predictions = np.argmax(self.model.predict(X_test), axis=1)
+
+        self.__display_digits(X_test, predictions, y_test, epoch, n=self.display_freq)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        image = Image.open(buf)
+        self.images.append(np.array(image))
+
+        if epoch % self.display_freq == 0:
+            plt.show()
+
+    def on_train_end(self, logs=None):
+        GIF_PATH = "./animation.gif"
+        imageio.mimsave(GIF_PATH, self.images, fps=1)
+
+
+# ===================== BEGIN INLINED CONSTANTS =====================
+# Get the project root directory
+PROJECT_ROOT = Path(__file__).absolute().parent
+
+# Set up the working directory
+try:
+    PROJECT_WORKING_DIRECTORY = Path(os.environ['ASNWD'])
+except Exception as e:
+    print(f"Environment variable ASNWD not set: {e}.\nUsing project root directory")
+    PROJECT_WORKING_DIRECTORY = PROJECT_ROOT
+
+asnwd = PROJECT_WORKING_DIRECTORY  # keep existing alias
+DATA_DIR = PROJECT_ROOT / "Data"
+PREPROCESS_DIR = PROJECT_ROOT / "Preprocess"
+TRAINING_DIR = PROJECT_ROOT / "Training"
+EVALUATION_DIR = PROJECT_ROOT / "Evaluation"
+
+# Create directories if they don't exist
+for directory in [DATA_DIR, PREPROCESS_DIR, TRAINING_DIR, EVALUATION_DIR]:
+    directory.mkdir(exist_ok=True)
+
+SYSTEM = platform.system()
+LOCAL_DEBUG = os.environ.get("LOCAL_DEBUG")
+
+# PLASTICC class mappings and weights
+PLASTICC_CLASS_MAPPING = {
+    90: "SNIa", 67: "SNIa-91bg", 52: "SNIax", 42: "SNII", 62: "SNIbc",
+    95: "SLSN-I", 15: "TDE", 64: "KN", 88: "AGN", 92: "RRL", 65: "M-dwarf",
+    16: "EB", 53: "Mira", 6: "$\\mu$-Lens-Single"
+}
+
+PLASTICC_WEIGHTS_DICT = {
+    6: 1 / 18, 15: 1 / 9, 16: 1 / 18, 42: 1 / 18, 52: 1 / 18, 53: 1 / 18,
+    62: 1 / 18, 64: 1 / 9, 65: 1 / 18, 67: 1 / 18, 88: 1 / 18, 90: 1 / 18,
+    92: 1 / 18, 95: 1 / 18, 99: 1 / 19, 1: 1 / 18, 2: 1 / 18, 3: 1 / 18,
+}
+
+# LSST filter definitions
+LSST_FILTER_MAP = {
+    0: "lsstu", 1: "lsstg", 2: "lsstr", 3: "lssti", 4: "lsstz", 5: "lssty"
+}
+
+LSST_PB_WAVELENGTHS = {
+    "lsstu": 3685.0, "lsstg": 4802.0, "lsstr": 6231.0,
+    "lssti": 7542.0, "lsstz": 8690.0, "lssty": 9736.0,
+}
+
+LSST_PB_COLORS = {
+    "lsstu": "#984ea3", "lsstg": "#4daf4a", "lsstr": "#e41a1c",
+    "lssti": "#377eb8", "lsstz": "#ff7f00", "lssty": "#e3c530",
+}
+
+# ZTF filter definitions
+ZTF_FILTER_MAP = {1: "ztfg", 2: "ztfr", 3: "ztfi"}
+
+ZTF_FILTER_MAP_COLORS = {
+    1: "#4daf4a", 2: "#e41a1c", 3: "#377eb8"
+}
+
+ZTF_PB_WAVELENGTHS = {
+    "ztfg": 4804.79, "ztfr": 6436.92, "ztfi": 7968.22
+}
+
+ZTF_PB_COLORS = {
+    "ztfg": "#4daf4a", "ztfr": "#e41a1c", "ztfi": "#377eb8"
+}
+# ===================== END INLINED CONSTANTS =====================
+
+
 
 # Set up logging
 try:
